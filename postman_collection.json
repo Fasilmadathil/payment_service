@@ -1,0 +1,270 @@
+{
+  "info": {
+    "_postman_id": "3c7f6d23-912d-43e6-b3b0-f0e380730053",
+    "name": "Payment Service API",
+    "description": "StartFragment\n\nThis collection demonstrates a payment event ingestion and reconciliation system built around an event-driven transaction model.\n\n### Flow Overview\n\n1. Events are ingested via `POST /events`\n    \n    - Each event represents a state change in the payment lifecycle\n        \n    - The system is idempotent, duplicate `event_id` values are safely ignored\n        \n2. Transaction state is derived from event history\n    \n    - Transactions are created automatically on first event\n        \n    - State transitions (initiated → processed → settled) are handled incrementally\n        \n3. Transactions can be queried via `GET /transactions`\n    \n    - Supports filtering (merchant, status, date range)\n        \n    - Supports pagination (limit, offset)\n        \n    - All filtering and sorting are executed at the SQL level\n        \n4. Reconciliation APIs validate system consistency\n    \n    - `GET /reconciliation/summary` provides aggregated views\n        \n    - `GET /reconciliation/discrepancies` identifies inconsistencies\n        \n\n---\n\n### How to Use This Collection\n\n1. Run **Events (Ingestion)** to create a transaction (`transaction_id = tx-1`)\n    \n2. Run **POST duplicate event** to verify idempotency\n    \n3. Use **GET /transactions** to view stored data\n    \n4. Use filters (merchant_id, payment_status) to validate query behavior\n    \n5. Use **GET /transactions/{id}** to inspect full transaction lifecycle\n    \n6. Run reconciliation endpoints to validate system correctness\n    \n\n---\n\n### Key Design Features\n\n- **Idempotent Ingestion**  \n    Ensured via unique constraint on `event_id`, preventing duplicate processing\n    \n- **Event Sourcing Pattern**  \n    Transaction state is derived from immutable event history\n    \n- **Separation of Concerns**\n    \n    - Events → audit log\n        \n    - Transactions → current state\n        \n- **SQL-Driven Querying**  \n    Filtering, aggregation, and pagination are executed in the database layer\n    \n- **Reconciliation Engine**  \n    Detects issues such as:\n    \n    - processed but not settled\n        \n    - failed but settled\n        \n    - delayed settlement\n        \n    - event/state mismatches\n        \n\n---\n\n### Notes\n\n- The API is deployed on Render (free tier), initial requests may be slow due to cold start\n    \n- Ensure ingestion requests are executed before querying specific transaction IDs\n    \n- Use `/transactions` response to obtain valid transaction IDs for testing",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "32990867"
+  },
+  "item": [
+    {
+      "name": "Events",
+      "item": [
+        {
+          "name": "1. Events (Ingestion)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": "{\r\n  \"event_id\": \"test-123\",\r\n  \"event_type\": \"payment_initiated\",\r\n  \"transaction_id\": \"tx-1\",\r\n  \"merchant_id\": \"m1\",\r\n  \"merchant_name\": \"Test Merchant\",\r\n  \"amount\": 1000,\r\n  \"currency\": \"INR\",\r\n  \"timestamp\": \"2026-01-08T12:11:58.085567+00:00\"\r\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/events/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "events",
+                ""
+              ]
+            },
+            "description": "Ingests a payment lifecycle event.\n\nThis is the primary entry point of the system. Each event updates the transaction state and is stored in the event history table.\n\nKey behaviors:\n\n- Idempotent: duplicate event_id will not create duplicate records\n    \n- Automatically creates merchant and transaction if they do not exist\n    \n- Updates transaction state based on event_type\n    \n\nSupported event types:\n\n- payment_initiated\n    \n- payment_processed\n    \n- payment_failed\n    \n- settled"
+          },
+          "response": []
+        },
+        {
+          "name": "POST duplicate event",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": "{\r\n  \"event_id\": \"test-123\",\r\n  \"event_type\": \"payment_initiated\",\r\n  \"transaction_id\": \"tx-1\",\r\n  \"merchant_id\": \"m1\",\r\n  \"merchant_name\": \"Test Merchant\",\r\n  \"amount\": 1000,\r\n  \"currency\": \"INR\",\r\n  \"timestamp\": \"2026-01-08T12:11:58.085567+00:00\"\r\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/events/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "events",
+                ""
+              ]
+            },
+            "description": "Tests idempotency of the ingestion system.\n\nThis request sends the same event twice using the same event_id.\n\nExpected behavior:\n\n- The second request should be ignored\n    \n- No duplicate event should be created\n    \n- Transaction state should remain unchanged\n    \n\nThis validates the unique constraint and safe ingestion logic."
+          },
+          "response": []
+        }
+      ],
+      "description": "Handles ingestion of payment lifecycle events.  \nIncludes idempotency validation and duplicate event testing."
+    },
+    {
+      "name": "Transactions",
+      "item": [
+        {
+          "name": "GET /transactions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions"
+              ]
+            },
+            "description": "Returns a list of transactions with support for filtering, sorting, and pagination.\n\nSupported query parameters:\n\n- merchant_id: filter by merchant\n    \n- payment_status: initiated | processed | failed\n    \n- settlement_status: pending | settled\n    \n- start_date / end_date: filter by time range\n    \n- limit: number of records\n    \n- offset: pagination offset\n    \n\nImplementation details:\n\n- Filtering is executed at the database level (no Python loops)\n    \n- Results are sorted by created_at (latest first)\n    \n- Total count is returned for pagination support"
+          },
+          "response": []
+        },
+        {
+          "name": "filter merchant id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions?merchant_id=m1",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "merchant_id",
+                  "value": "m1"
+                }
+              ]
+            },
+            "description": "Filters transactions by merchant_id.\n\nUsed to validate that indexing and filtering are correctly applied at the database level."
+          },
+          "response": []
+        },
+        {
+          "name": "filters payment status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions?payment_status=processed",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "payment_status",
+                  "value": "processed"
+                }
+              ]
+            },
+            "description": "Filters transactions by payment_status or settlement_status.\n\nUsed to verify correct state transitions and query accuracy."
+          },
+          "response": []
+        },
+        {
+          "name": "filters pagination",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions?limit=5&offset=0",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "5"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            },
+            "description": "Tests pagination using limit and offset.\n\nUsed to verify:\n\n- correct slicing of results\n    \n- consistent total count\n    \n- proper ordering"
+          },
+          "response": []
+        },
+        {
+          "name": "GET /transaction /id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions/{{transaction_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions",
+                "{{transaction_id}}"
+              ]
+            },
+            "description": "Fetches detailed information for a single transaction.\n\nResponse includes:\n\n- transaction details (current state)\n    \n- associated merchant information\n    \n- complete event history in chronological order\n    \n\nThis endpoint demonstrates:\n\n- relationship between events and transaction state\n    \n- traceability of transaction lifecycle"
+          },
+          "response": []
+        }
+      ],
+      "description": "Provides APIs to retrieve transaction data with filtering, pagination, and detailed views.\n\nRun \"Events (Ingestion)\" first to create transaction_id = tx-1.  \nYou can replace {{transaction_id}} with any ID returned from GET /transactions."
+    },
+    {
+      "name": "Reconciliation",
+      "item": [
+        {
+          "name": "GET summary",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/reconciliation/summary",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "reconciliation",
+                "summary"
+              ]
+            },
+            "description": "Returns aggregated transaction data grouped by:\n\n- merchant_id\n    \n- payment_status\n    \n- settlement_status\n    \n\nThis endpoint demonstrates:\n\n- SQL GROUP BY usage\n    \n- aggregation at the database level\n    \n- high-level view of transaction distribution\n    \n\nUsed for reporting and operational insights."
+          },
+          "response": []
+        },
+        {
+          "name": "GET discrepancies",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/reconciliation/discrepancies",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "reconciliation",
+                "discrepancies"
+              ]
+            },
+            "description": "Identifies inconsistencies between payment and settlement states.\n\nExamples of discrepancies:\n\n- payment processed but not settled\n    \n- payment failed but marked as settled\n    \n\nThis endpoint is critical for:\n\n- financial reconciliation\n    \n- detecting system inconsistencies\n    \n- identifying edge cases and data issues"
+          },
+          "response": []
+        }
+      ],
+      "description": "Provides summary and discrepancy detection for transaction reconciliation."
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "packages": {},
+        "requests": {},
+        "exec": [
+          ""
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "packages": {},
+        "requests": {},
+        "exec": [
+          ""
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://payment-service-o236.onrender.com"
+    },
+    {
+      "key": "transaction_id",
+      "value": "tx-1"
+    }
+  ]
+}

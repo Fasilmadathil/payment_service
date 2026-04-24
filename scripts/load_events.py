@@ -2,7 +2,7 @@ import requests
 import json
 from time import sleep
 
-URL = "http://127.0.0.1:8000/events/"
+URL = "https://payment-service-o236.onrender.com/events/"
 
 with open("data/sample_events.json") as f:
     events = json.load(f)

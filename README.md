@@ -17,8 +17,8 @@ It exposes APIs for:
 ### Designed to handle real-world challenges:
 
 - **Duplicate events** — idempotency via unique `event_id`
-- **Out-of-order delivery** — timestamp-based event ordering
-- **Concurrent updates** — row-level locking to prevent race conditions
+- **Out-of-order delivery** — ordering enforced via `last_event_at`; stale events are stored but ignored
+- **Concurrent updates** — row-level locking (`SELECT FOR UPDATE`) implemented in the service layer to prevent race conditions
 
 ---
 
@@ -31,6 +31,52 @@ API Layer        →  FastAPI (request validation, routing)
 Service Layer    →  Business logic (event processing, reconciliation)
 Data Layer       →  SQLAlchemy + PostgreSQL
 ```
+
+---
+
+## 🎯 Design Decisions
+
+These are the key technical choices made and the reasoning behind them:
+
+| Decision | Why |
+|---|---|
+| **FastAPI** | High performance, native async support, and automatic request validation via Pydantic — ideal for event ingestion at volume |
+| **PostgreSQL (production)** | ACID compliance, row-level locking (`SELECT FOR UPDATE`), and robust support for concurrent writes |
+| **SQLite (local dev)** | Zero-config local setup; same SQLAlchemy ORM layer means no code changes needed between environments |
+| **Event sourcing approach** | Transaction state is *derived* from the event stream — never mutated directly. This ensures a full, trustworthy audit trail |
+| **Unique constraint on `event_id`** | Database-enforced idempotency. Even if the application layer misses a duplicate, the DB rejects it |
+| **Synchronous processing** | Chosen deliberately for simplicity and debuggability at this scope; async queues are listed as a future improvement |
+
+---
+
+## 🗄️ Database Choice
+
+**PostgreSQL** is used in production because:
+- Native support for row-level locking (`SELECT FOR UPDATE`) — critical for safe concurrent event processing
+- ACID-compliant transactions ensure atomicity across event ingestion and state updates
+- Mature indexing and query planner handles high-volume filtering efficiently
+
+**SQLite** is used locally because:
+- Zero configuration — no server process required
+- The same SQLAlchemy ORM layer is reused, so no code changes are needed between environments
+
+---
+
+## 🔁 Idempotency Strategy
+
+Idempotency is enforced at two levels:
+
+**1. Database constraint (primary enforcement):**
+A `UNIQUE` constraint on `event_id` in the `events` table means the database will reject any duplicate outright — even if the application layer fails to catch it.
+
+**2. Application layer (graceful handling):**
+When a duplicate is detected, the system:
+- Catches the constraint error
+- Rolls back the transaction cleanly
+- Returns a success response (the event was already processed — retrying is safe)
+- Logs the attempt with `processing_status = duplicate` for observability
+
+This means callers can safely retry on network failure without risk of double-processing.
 
 ---
 
@@ -136,6 +182,28 @@ All events are stored as an immutable log for traceability and debugging.
 
 ---
 
+## 🔄 State Transition Model
+
+Transactions follow a strict lifecycle. Invalid transitions (e.g., jumping from `initiated` directly to `settled`) are rejected and logged with `processing_status = invalid_transition`.
+
+```
+payment_initiated
+       │
+       ▼
+payment_processed ──────────────────┐
+       │                            │
+       ▼                            ▼
+   settled                     payment_failed
+  (terminal)                    (terminal)
+```
+
+**Rules:**
+- `payment_initiated` → `payment_processed` or `payment_failed` only
+- `payment_processed` → `settled` or `payment_failed` only
+- `settled` and `payment_failed` are **terminal** — no further transitions allowed
+
+---
+
 ## 📡 API Endpoints
 
 ### 1. Ingest Event
@@ -214,15 +282,27 @@ GET /reconciliation/discrepancies
 
 ---
 
-## 📊 Sample Data
+## 📊 Sample Data & Data Generation
 
-A dataset of ~10,000 events is used to simulate:
+A dataset of ~10,000 events is used to simulate realistic payment scenarios.
 
-- Successful transactions
-- Failed transactions
-- Duplicate events
-- Out-of-order events
-- Inconsistent states
+### Generation Strategy
+
+Sample data is generated via `scripts/load_events.py`, which deliberately produces:
+
+| Scenario | Purpose |
+|---|---|
+| Successful flows (`initiated → processed → settled`) | Happy-path validation |
+| Failed payments (`initiated → failed`) | Terminal state protection testing |
+| Duplicate `event_id`s | Idempotency verification |
+| Out-of-order timestamps | Event ordering logic validation |
+| Delayed settlements | Reconciliation discrepancy detection |
+
+Run the loader:
+
+```bash
+python scripts/load_events.py
+```
 
 **Example Event:**
 
@@ -238,6 +318,39 @@ A dataset of ~10,000 events is used to simulate:
   "timestamp": "2026-01-08T12:11:58.085567+00:00"
 }
 ```
+
+---
+
+## 🗂️ Database Optimization
+
+Indexes are added to support efficient filtering, lookups, and joins at scale:
+
+| Index | Column | Table | Reason |
+|---|---|---|---|
+| Unique constraint | `event_id` | `events` | Enforces idempotency at DB level |
+| Index | `transaction_id` | `events` | Fast event history lookup per transaction |
+| Index | `merchant_id` | `transactions` | Efficient merchant-level filtering and reconciliation |
+| Index | `payment_status` | `transactions` | Fast status-based queries |
+| Index | `settlement_status` | `transactions` | Efficient discrepancy detection |
+
+> **Note:** `SQLAlchemy create_all` is used instead of Alembic migrations for simplicity in this scope. A production system would use versioned migrations.
+
+---
+
+## 🚨 Error Handling
+
+The API provides structured, predictable error responses across all failure modes:
+
+| Scenario | Behaviour |
+|---|---|
+| Invalid payload (missing fields, wrong types) | `422 Unprocessable Entity` — FastAPI/Pydantic validation |
+| Duplicate `event_id` | Accepted gracefully; logged with `processing_status = duplicate` |
+| Out-of-order event (stale timestamp) | Accepted and stored; logged with `processing_status = stale`, transaction not updated |
+| Invalid state transition | Stored with `processing_status = invalid_transition`, error message logged |
+| Event on terminal transaction | Stored with `processing_status = terminal_state_blocked` |
+| Unexpected server error | `500` with error detail; event stored with `processing_status = error` |
+
+All rejection reasons are persisted in the event audit log — nothing is silently dropped.
 
 ---
 
@@ -275,7 +388,7 @@ pip install -r requirements.txt
 ### 4. Configure Environment Variables
 
 ```bash
-export DATABASE_URL=your_database_url
+export DATABASE_URL=sqlite:///./dev.db
 ```
 
 ### 5. Run the Server
@@ -290,11 +403,30 @@ Server runs at: `http://127.0.0.1:8000`
 
 ## 🚀 Deployment
 
-| Property | Value               |
-|----------|---------------------|
-| Platform | Render              |
-| Database | Managed PostgreSQL  |
-| Base URL | `<your_render_url>` |
+| Property | Value              |
+|----------|--------------------|
+| Platform | Render             |
+| Database | Managed PostgreSQL |
+| Base URL | `https://payment-service-o236.onrender.com` |
+
+---
+
+## ⚡ Quick Test Flow
+
+The fastest way to verify the service end-to-end:
+
+**Option A — Swagger UI (no tooling required):**
+
+1. Open: `https://payment-service-o236.onrender.com/docs`
+2. Run `POST /events` with the sample payload from the [Sample Data](#-sample-data--data-generation) section
+3. Verify with `GET /transactions` and `GET /transactions/{transaction_id}`
+4. Check `GET /reconciliation/summary` and `GET /reconciliation/discrepancies`
+
+**Option B — Postman:**
+
+Import `postman_collection.json` from the root of the repository and run requests sequentially.
+
+> **Tip:** Load bulk test data first with `python scripts/load_events.py` to see reconciliation results populated.
 
 ---
 
@@ -302,10 +434,10 @@ Server runs at: `http://127.0.0.1:8000`
 
 ### Postman
 
-Collection available at:
+Collection available at the root of the repository:
 
 ```
-/docs/postman
+postman_collection.json
 ```
 
 ### Bulk Event Loader
@@ -326,11 +458,16 @@ python scripts/load_events.py
 
 ## ⚖️ Trade-offs
 
-| Decision                     | Pros                  | Cons                                      |
-|------------------------------|-----------------------|-------------------------------------------|
-| Synchronous Processing       | Simpler architecture  | Less resilient under high traffic spikes  |
-| No Retry / Dead Letter Queue | Easier implementation | Risk of dropped events                    |
-| Row-Level Locking            | Strong consistency    | Reduced throughput under high concurrency |
+### Architectural Choices
+
+| Decision | Pros | Cons |
+|---|---|---|
+| Synchronous processing | Simpler architecture, easier to debug | Less resilient under high traffic spikes |
+| No retry / Dead Letter Queue | Easier implementation | Risk of dropped events on transient failures |
+| Row-level locking | Strong consistency, no dirty reads | Reduced throughput under very high concurrency |
+| `create_all` instead of migrations | Fast local setup, no tooling overhead | Not suitable for production schema evolution |
+| Limited state transition validation | Keeps system lightweight and fast | Less strict enforcement of business rules |
+| No async processing or queues | Simpler codebase, within project scope | Cannot handle burst traffic; no replay capability |
 
 ---
 
