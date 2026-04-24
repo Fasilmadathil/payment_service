@@ -1,0 +1,19 @@
+# Cache and environment
+.pytest_cache/
+venv/
+.env
+
+# Database and local scripts
+test.db
+reset_db.py
+
+# Documentation and plans
+implementation_plan.txt
+SYSTEM_DETAILS.md
+
+# Test outputs
+test_output_*.txt
+
+# Python bytecode
+__pycache__/
+*.py[cod]
